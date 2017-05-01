@@ -766,6 +766,7 @@ static int ram_save_page(QEMUFile *f, PageSearchStatus *pss,
             }
         }
     } else {
+        // 对于全0的page，放1个0完事
         pages = save_zero_page(f, block, offset, p, bytes_transferred);
         if (pages > 0) {
             /* Must let xbzrle know, otherwise a previous (now 0'd) cached
@@ -790,6 +791,7 @@ static int ram_save_page(QEMUFile *f, PageSearchStatus *pss,
     if (pages == -1) {
         *bytes_transferred += save_page_header(f, block,
                                                offset | RAM_SAVE_FLAG_PAGE);
+        // 把该page写到f
         if (send_async) {
             qemu_put_buffer_async(f, p, TARGET_PAGE_SIZE);
         } else {
@@ -2034,6 +2036,7 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
      * Must occur before EOS (or any QEMUFile operation)
      * because of RDMA protocol.
      */
+    // ???
     ram_control_after_iterate(f, RAM_CONTROL_ROUND);
 
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);

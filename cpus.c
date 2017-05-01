@@ -743,8 +743,10 @@ static int do_vm_stop(RunState state)
 
     if (runstate_is_running()) {
         cpu_disable_ticks();
+        // 停止所有vcpu的运行
         pause_all_vcpus();
         runstate_set(state);
+        // 通知状态
         vm_state_notify(0, state);
         qapi_event_send_stop(&error_abort);
     }
@@ -825,6 +827,7 @@ static void qemu_kvm_eat_signals(CPUState *cpu)
     sigaddset(&waitset, SIG_IPI);
     sigaddset(&waitset, SIGBUS);
 
+    // 吃掉所有pending的 SIG_IPI 和 SIGBUS
     do {
         r = sigtimedwait(&waitset, &siginfo, &ts);
         if (r == -1 && !(errno == EAGAIN || errno == EINTR)) {
@@ -841,7 +844,7 @@ static void qemu_kvm_eat_signals(CPUState *cpu)
         default:
             break;
         }
-
+        // 检查是否还有pending的信号，写到chkset
         r = sigpending(&chkset);
         if (r == -1) {
             perror("sigpending");
@@ -963,7 +966,7 @@ static void qemu_kvm_wait_io_event(CPUState *cpu)
     while (cpu_thread_is_idle(cpu)) {
         qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
     }
-
+    // 吃掉pending的信号，如 SIG_IPI
     qemu_kvm_eat_signals(cpu);
     qemu_wait_io_event_common(cpu);
 }
@@ -991,6 +994,7 @@ static void *qemu_kvm_cpu_thread_fn(void *arg)
 
     /* signal CPU creation */
     cpu->created = true;
+    // vcpu创建完成，通知主线程
     qemu_cond_signal(&qemu_cpu_cond);
 
     do {
@@ -1229,6 +1233,7 @@ static void qemu_cpu_kick_thread(CPUState *cpu)
         return;
     }
     cpu->thread_kicked = true;
+    // 通过pthread_kill发送SIG_IPI信号给指定的vcpu线程进行唤醒
     err = pthread_kill(cpu->thread->thread, SIG_IPI);
     if (err) {
         fprintf(stderr, "qemu:%s: %s", __func__, strerror(err));
@@ -1254,7 +1259,9 @@ static void qemu_cpu_kick_no_halt(void)
 
 void qemu_cpu_kick(CPUState *cpu)
 {
+    // 唤醒所有等待在 cpu->halt_cond 上的vcpu线程
     qemu_cond_broadcast(cpu->halt_cond);
+    // 对于不是TCG的且还没有被kick的vcpu线程进行唤醒
     if (tcg_enabled()) {
         qemu_cpu_kick_no_halt();
     } else {
@@ -1330,6 +1337,7 @@ void pause_all_vcpus(void)
     CPUState *cpu;
 
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false);
+
     CPU_FOREACH(cpu) {
         cpu->stop = true;
         qemu_cpu_kick(cpu);
@@ -1347,6 +1355,7 @@ void pause_all_vcpus(void)
     }
 
     while (!all_vcpus_paused()) {
+        // 等待 qemu_pause_cond?
         qemu_cond_wait(&qemu_pause_cond, &qemu_global_mutex);
         CPU_FOREACH(cpu) {
             qemu_cpu_kick(cpu);
@@ -1429,7 +1438,9 @@ static void qemu_kvm_start_vcpu(CPUState *cpu)
              cpu->cpu_index);
     qemu_thread_create(cpu->thread, thread_name, qemu_kvm_cpu_thread_fn,
                        cpu, QEMU_THREAD_JOINABLE);
+    // 如果线程没有创建成功，则一直在此处阻塞
     while (!cpu->created) {
+        // 等待 qemu_cpu_cond
         qemu_cond_wait(&qemu_cpu_cond, &qemu_global_mutex);
     }
 }
@@ -1487,6 +1498,7 @@ void cpu_stop_current(void)
 
 int vm_stop(RunState state)
 {
+    // qemu运行在vcpu(线程)上
     if (qemu_in_vcpu_thread()) {
         qemu_system_vmstop_request_prepare();
         qemu_system_vmstop_request(state);

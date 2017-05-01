@@ -2644,6 +2644,7 @@ int kvm_arch_put_registers(CPUState *cpu, int level)
     X86CPU *x86_cpu = X86_CPU(cpu);
     int ret;
 
+    // 必须处于停止状态
     assert(cpu_is_stopped(cpu) || qemu_cpu_is_self(cpu));
 
     if (level >= KVM_PUT_RESET_STATE) {

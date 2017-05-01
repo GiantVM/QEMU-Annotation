@@ -918,9 +918,10 @@ static bool enforce_config_section(void)
 void qemu_savevm_state_header(QEMUFile *f)
 {
     trace_savevm_state_header();
+    // 写入magic和version
     qemu_put_be32(f, QEMU_VM_FILE_MAGIC);
     qemu_put_be32(f, QEMU_VM_FILE_VERSION);
-
+    // 如果需要，写入configuration
     if (!savevm_state.skip_configuration || enforce_config_section()) {
         qemu_put_byte(f, QEMU_VM_CONFIGURATION);
         vmstate_save_state(f, &vmstate_configuration, &savevm_state, 0);
@@ -935,13 +936,16 @@ void qemu_savevm_state_begin(QEMUFile *f,
     int ret;
 
     trace_savevm_state_begin();
+    // 如果定义了 set_params ，调用之
     QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!se->ops || !se->ops->set_params) {
             continue;
         }
         se->ops->set_params(params, se->opaque);
     }
-
+    // 如果定义了 save_live_setup ，调用之，将状态写入文件
+    // 不同类型的设备有不同实现，如 ram_save_setup、block_save_setup、htab_save_setup)
+    // 注意每项SaveStateEntry要用 header 和 footer 夹着，它们都带section_id
     QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!se->ops || !se->ops->save_live_setup) {
             continue;
@@ -954,6 +958,7 @@ void qemu_savevm_state_begin(QEMUFile *f,
         save_section_header(f, se, QEMU_VM_SECTION_START);
 
         ret = se->ops->save_live_setup(f, se->opaque);
+
         save_section_footer(f, se);
         if (ret < 0) {
             qemu_file_set_error(f, ret);
@@ -989,6 +994,7 @@ int qemu_savevm_state_iterate(QEMUFile *f, bool postcopy)
          * call that's already run, it might get confused if we call
          * iterate afterwards.
          */
+        // 如果没设备定义save_live_complete_postcopy，则不知道要干嘛，直接跳过
         if (postcopy && !se->ops->save_live_complete_postcopy) {
             continue;
         }
@@ -998,7 +1004,8 @@ int qemu_savevm_state_iterate(QEMUFile *f, bool postcopy)
         trace_savevm_section_start(se->idstr, se->section_id);
 
         save_section_header(f, se, QEMU_VM_SECTION_PART);
-
+        // 如果有 save_live_iterate，调用之
+        // 如block_save_iterate、ram_save_iterate、htab_save_iterate
         ret = se->ops->save_live_iterate(f, se->opaque);
         trace_savevm_section_end(se->idstr, se->section_id, ret);
         save_section_footer(f, se);
@@ -1073,11 +1080,14 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only)
 
     trace_savevm_state_complete_precopy();
 
+    // 获取所有vcpu的寄存器等信息，更新CPUState
     cpu_synchronize_all_states();
 
+    // 调用save_live_complete_precopy
     QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!se->ops ||
             (in_postcopy && se->ops->save_live_complete_postcopy) ||
+            // iterable_only为false 用于postcopy时跳过该阶段
             (in_postcopy && !iterable_only) ||
             !se->ops->save_live_complete_precopy) {
             continue;
@@ -1120,11 +1130,13 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only)
 
         trace_savevm_section_start(se->idstr, se->section_id);
 
+        // 往json中写入 name 和 instance_id
         json_start_object(vmdesc, NULL);
         json_prop_str(vmdesc, "name", se->idstr);
         json_prop_int(vmdesc, "instance_id", se->instance_id);
 
         save_section_header(f, se, QEMU_VM_SECTION_FULL);
+        // 发送vmsd
         vmstate_save(f, se, vmdesc);
         trace_savevm_section_end(se->idstr, se->section_id, 0);
         save_section_footer(f, se);
@@ -1134,6 +1146,7 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only)
 
     if (!in_postcopy) {
         /* Postcopy stream will still be going */
+        // 如果没有postcopy，写入结束
         qemu_put_byte(f, QEMU_VM_EOF);
     }
 
@@ -1141,6 +1154,7 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only)
     qjson_finish(vmdesc);
     vmdesc_len = strlen(qjson_get_str(vmdesc));
 
+    // 如果需要，单独写一段 vmdesc
     if (should_send_vmdesc()) {
         qemu_put_byte(f, QEMU_VM_VMDESCRIPTION);
         qemu_put_be32(f, vmdesc_len);
@@ -1148,6 +1162,7 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only)
     }
     qjson_destroy(vmdesc);
 
+    // 刷入文件
     qemu_fflush(f);
 }
 
@@ -1198,8 +1213,10 @@ static int qemu_savevm_state(QEMUFile *f, Error **errp)
         .blk = 0,
         .shared = 0
     };
+    // 初始化MigrationState结构
     MigrationState *ms = migrate_init(&params);
     MigrationStatus status;
+    // 设置state要保存到的目标文件
     ms->to_dst_file = f;
 
     if (migration_is_blocked(errp)) {
@@ -1207,12 +1224,17 @@ static int qemu_savevm_state(QEMUFile *f, Error **errp)
         goto done;
     }
 
+    // 开始
     qemu_mutex_unlock_iothread();
+    // 往文件开头写入magic和version，QEMU_VM_CONFIGURATION
     qemu_savevm_state_header(f);
+    // 遍历savevm_state.handlers，调用它们的 save_live_setup
     qemu_savevm_state_begin(f, &params);
     qemu_mutex_lock_iothread();
 
     while (qemu_file_get_error(f) == 0) {
+        // 不断保存，直到返回1表示结束
+        // 遍历savevm_state.handlers，调用它们的 save_live_iterate
         if (qemu_savevm_state_iterate(f, false) > 0) {
             break;
         }
@@ -1220,6 +1242,7 @@ static int qemu_savevm_state(QEMUFile *f, Error **errp)
 
     ret = qemu_file_get_error(f);
     if (ret == 0) {
+        //
         qemu_savevm_state_complete_precopy(f, false);
         ret = qemu_file_get_error(f);
     }
@@ -1454,7 +1477,9 @@ static void *postcopy_ram_listen_thread(void *opaque)
      * Because we're a thread and not a coroutine we can't yield
      * in qemu_file, and thus we must be blocking now.
      */
+    // 阻塞
     qemu_file_set_blocking(f, true);
+    // 根据请求的类型进行相应的处理
     load_res = qemu_loadvm_state_main(f, mis);
     /* And non-blocking again so we don't block in any cleanup */
     qemu_file_set_blocking(f, false);
@@ -1931,6 +1956,7 @@ int qemu_loadvm_state(QEMUFile *f)
         return -EINVAL;
     }
 
+    // 读取并验证magic和version
     v = qemu_get_be32(f);
     if (v != QEMU_VM_FILE_MAGIC) {
         error_report("Not a migration stream");
@@ -1947,6 +1973,7 @@ int qemu_loadvm_state(QEMUFile *f)
         return -ENOTSUP;
     }
 
+    // 如果没有设置skip_configuration，需要读取并加载configuration
     if (!savevm_state.skip_configuration || enforce_config_section()) {
         if (qemu_get_byte(f) != QEMU_VM_CONFIGURATION) {
             error_report("Configuration section missing");
@@ -1983,6 +2010,7 @@ int qemu_loadvm_state(QEMUFile *f)
      * We also mustn't read data that isn't there; some transports (RDMA)
      * will stall waiting for that data when the source has already closed.
      */
+    // 读VMDESC section
     if (ret == 0 && should_send_vmdesc()) {
         uint8_t *buf;
         uint32_t size;
@@ -2041,6 +2069,7 @@ void hmp_savevm(Monitor *mon, const QDict *qdict)
         return;
     }
 
+    // 获取能做snapshot的块设备状态(bs)
     bs = bdrv_all_find_vmstate_bs();
     if (bs == NULL) {
         monitor_printf(mon, "No block device can accept snapshots\n");
@@ -2048,6 +2077,7 @@ void hmp_savevm(Monitor *mon, const QDict *qdict)
     }
     aio_context = bdrv_get_aio_context(bs);
 
+    // 当前vm是否在运行，如果是，待会要恢复
     saved_vm_running = runstate_is_running();
 
     ret = global_state_store();
@@ -2055,6 +2085,8 @@ void hmp_savevm(Monitor *mon, const QDict *qdict)
         monitor_printf(mon, "Error saving global state\n");
         return;
     }
+
+    // 停止VM和其对应的vcpu，设置状态
     vm_stop(RUN_STATE_SAVE_VM);
 
     aio_context_acquire(aio_context);
@@ -2062,11 +2094,13 @@ void hmp_savevm(Monitor *mon, const QDict *qdict)
     memset(sn, 0, sizeof(*sn));
 
     /* fill auxiliary fields */
+    // 获取停止时的时间，设置到 QEMUSnapshotInfo 中
     qemu_gettimeofday(&tv);
     sn->date_sec = tv.tv_sec;
     sn->date_nsec = tv.tv_usec * 1000;
     sn->vm_clock_nsec = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    // 如果老的snapshot存在，将它的name和id作为新snapshot的name和id
     if (name) {
         ret = bdrv_snapshot_find(bs, old_sn, name);
         if (ret >= 0) {
@@ -2082,19 +2116,23 @@ void hmp_savevm(Monitor *mon, const QDict *qdict)
     }
 
     /* save the VM state */
+    // 保存VM的状态到block device
+    // QEMUFile结构提供了2MB的缓存，缓存满时会调用 put_buffer 将缓存刷到 block device
     f = qemu_fopen_bdrv(bs, 1);
     if (!f) {
         monitor_printf(mon, "Could not open VM state file\n");
         goto the_end;
     }
+    // migrate
     ret = qemu_savevm_state(f, &local_err);
+    // 获取state的大小，以创建snapshot
     vm_state_size = qemu_ftell(f);
     qemu_fclose(f);
     if (ret < 0) {
         error_report_err(local_err);
         goto the_end;
     }
-
+    // 创建snapshot
     ret = bdrv_all_create_snapshot(sn, bs, vm_state_size, &bs);
     if (ret < 0) {
         monitor_printf(mon, "Error while creating snapshot on '%s'\n",
@@ -2187,7 +2225,7 @@ int load_vmstate(const char *name)
                      bdrv_get_device_name(bs), name);
         return ret;
     }
-
+    // 获取能做snapshot的块设备状态(bs)
     bs_vm_state = bdrv_all_find_vmstate_bs();
     if (!bs_vm_state) {
         error_report("No block device supports snapshots");
@@ -2197,6 +2235,7 @@ int load_vmstate(const char *name)
 
     /* Don't even try to load empty VM states */
     aio_context_acquire(aio_context);
+    // 查找snapshot
     ret = bdrv_snapshot_find(bs_vm_state, &sn, name);
     aio_context_release(aio_context);
     if (ret < 0) {
@@ -2206,10 +2245,10 @@ int load_vmstate(const char *name)
             "using qemu-img.");
         return -EINVAL;
     }
-
+    // 刷掉当前的所有IO状态，避免影响恢复
     /* Flush all IO requests so they don't interfere with the new state.  */
     bdrv_drain_all();
-
+    // 加载名为name的snapshot
     ret = bdrv_all_goto_snapshot(name, &bs);
     if (ret < 0) {
         error_report("Error %d while activating snapshot '%s' on '%s'",
@@ -2218,6 +2257,7 @@ int load_vmstate(const char *name)
     }
 
     /* restore the VM state */
+    // 打开文件
     f = qemu_fopen_bdrv(bs_vm_state, 0);
     if (!f) {
         error_report("Could not open VM state file");
@@ -2228,6 +2268,7 @@ int load_vmstate(const char *name)
     migration_incoming_state_new(f);
 
     aio_context_acquire(aio_context);
+    // 恢复状态
     ret = qemu_loadvm_state(f);
     qemu_fclose(f);
     aio_context_release(aio_context);

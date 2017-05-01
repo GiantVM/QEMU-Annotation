@@ -1793,11 +1793,14 @@ void qmp_closefd(const char *fdname, Error **errp)
 
 static void hmp_loadvm(Monitor *mon, const QDict *qdict)
 {
+    // 当前vm是否在运行，如果是，待会要恢复
     int saved_vm_running  = runstate_is_running();
     const char *name = qdict_get_str(qdict, "name");
 
+    // 停止虚拟机
     vm_stop(RUN_STATE_RESTORE_VM);
 
+    // 加载状态，如果成功
     if (load_vmstate(name) == 0 && saved_vm_running) {
         vm_start();
     }
@@ -2492,11 +2495,11 @@ static int default_fmt_size = 4;
 static int is_valid_option(const char *c, const char *typestr)
 {
     char option[3];
-  
+
     option[0] = '-';
     option[1] = *c;
     option[2] = '\0';
-  
+
     typestr = strstr(typestr, option);
     return (typestr != NULL);
 }
@@ -2861,7 +2864,7 @@ static QDict *monitor_parse_arguments(Monitor *mon,
                     p++;
                     if(c != *p) {
                         if(!is_valid_option(p, typestr)) {
-                  
+
                             monitor_printf(mon, "%s: unsupported option -%c\n",
                                            cmd->name, *p);
                             goto fail;

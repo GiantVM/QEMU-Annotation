@@ -978,10 +978,13 @@ static MemoryListener kvm_io_listener = {
     .priority = 10,
 };
 
+// CPU的IPI通信接口
 static void kvm_handle_interrupt(CPUState *cpu, int mask)
 {
+    // 设置中断请求号
     cpu->interrupt_request |= mask;
 
+    // 如果发给不是当前CPU的，唤醒对应vcpu接收中断
     if (!qemu_cpu_is_self(cpu)) {
         qemu_cpu_kick(cpu);
     }
@@ -1925,9 +1928,9 @@ int kvm_cpu_exec(CPUState *cpu)
              */
             qemu_cpu_kick_self();
         }
-
+        // 开始运行vcpu
         run_ret = kvm_vcpu_ioctl(cpu, KVM_RUN, 0);
-
+        // 返回表示已VMEXIT
         attrs = kvm_arch_post_run(cpu, run);
 
         if (run_ret < 0) {

@@ -395,6 +395,7 @@ static void process_incoming_migration_co(void *opaque)
     ps = postcopy_state_get();
     trace_process_incoming_migration_co_end(ret, ps);
     if (ps != POSTCOPY_INCOMING_NONE) {
+        // 如果对面发来了 POSTCOPY_INCOMING_ADVISE ，表示可能开启postcopy，要进行准备，清理内存
         if (ps == POSTCOPY_INCOMING_ADVISE) {
             /*
              * Where a migration had postcopy enabled (and thus went to advise)
@@ -488,6 +489,7 @@ void migration_channel_connect(MigrationState *s,
             error_free(local_err);
         }
     } else {
+        // 非tls执行
         QEMUFile *f = qemu_fopen_channel_output(ioc);
 
         s->to_dst_file = f;
@@ -1555,6 +1557,7 @@ static int postcopy_start(MigrationState *ms, bool *old_vm_running)
     QIOChannelBuffer *bioc;
     QEMUFile *fb;
     int64_t time_at_stop = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    // 切换到 MIGRATION_STATUS_POSTCOPY_ACTIVE
     migrate_set_state(&ms->state, MIGRATION_STATUS_ACTIVE,
                       MIGRATION_STATUS_POSTCOPY_ACTIVE);
 
@@ -1565,6 +1568,7 @@ static int postcopy_start(MigrationState *ms, bool *old_vm_running)
     qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
     *old_vm_running = runstate_is_running();
     global_state_store();
+    // 停止VM
     ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
     if (ret < 0) {
         goto fail;
@@ -1579,6 +1583,7 @@ static int postcopy_start(MigrationState *ms, bool *old_vm_running)
      * Cause any non-postcopiable, but iterative devices to
      * send out their final data.
      */
+    // 提前执行本来要等到 migration_completion 时才做的complete_precopy，将vmstate都发过去
     qemu_savevm_state_complete_precopy(ms->to_dst_file, true);
 
     /*
@@ -1587,6 +1592,7 @@ static int postcopy_start(MigrationState *ms, bool *old_vm_running)
      * need to tell the destination to throw any pages it's already received
      * that are dirty
      */
+    // 在以前可能发过一些page(考虑precopy转入postcopy的情况)，但这些page已经被改了，需要告知dest去discard掉
     if (ram_postcopy_send_discard_bitmap(ms)) {
         error_report("postcopy send discard bitmap failed");
         goto fail;
@@ -1612,6 +1618,8 @@ static int postcopy_start(MigrationState *ms, bool *old_vm_running)
      * So we wrap the device state up in a package with a length at the start;
      * to do this we use a qemu_buf to hold the whole of the device state.
      */
+    // 专门创建一段buffer来打包vmdesc
+    // 不这样做的话，dest不知道要读到什么时候才能读完所有设备的信息，因此先把vmdesc发过去
     bioc = qio_channel_buffer_new(4096);
     qio_channel_set_name(QIO_CHANNEL(bioc), "migration-postcopy-buffer");
     fb = qemu_fopen_channel_output(QIO_CHANNEL(bioc));
@@ -1622,7 +1630,7 @@ static int postcopy_start(MigrationState *ms, bool *old_vm_running)
      * of the state
      */
     qemu_savevm_send_postcopy_listen(fb);
-
+    // 这次只写入vmdesc
     qemu_savevm_state_complete_precopy(fb, false);
     qemu_savevm_send_ping(fb, 3);
 
@@ -1631,6 +1639,7 @@ static int postcopy_start(MigrationState *ms, bool *old_vm_running)
     /* <><> end of stuff going into the package */
 
     /* Now send that blob */
+    // 通过to_dst_file来发
     if (qemu_savevm_send_packaged(ms->to_dst_file, bioc->data, bioc->usage)) {
         goto fail_closefb;
     }
@@ -1692,7 +1701,7 @@ static void migration_completion(MigrationState *s, int current_active_state,
         qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER);
         *old_vm_running = runstate_is_running();
         ret = global_state_store();
-
+        // 如果global_state.runstate保存成功，关机
         if (!ret) {
             ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
             /*
@@ -1703,7 +1712,9 @@ static void migration_completion(MigrationState *s, int current_active_state,
                 ret = bdrv_inactivate_all();
             }
             if (ret >= 0) {
+                // 取消速度限制
                 qemu_file_set_rate_limit(s->to_dst_file, INT64_MAX);
+
                 qemu_savevm_state_complete_precopy(s->to_dst_file, false);
             }
         }
@@ -1792,10 +1803,11 @@ static void *migration_thread(void *opaque)
     enum MigrationStatus current_active_state = MIGRATION_STATUS_ACTIVE;
     bool enable_colo = migrate_colo_enabled();
 
+    // 线程把自身加入到rcu的read列表中，这样才能调用 rcu_read_lock
     rcu_register_thread();
-
+    // 写入magic和version，如果需要，写入 vmstate_configuration
     qemu_savevm_state_header(s->to_dst_file);
-
+    // 如果支持postcopy
     if (migrate_postcopy_ram()) {
         /* Now tell the dest that it should open its end so it can reply */
         qemu_savevm_send_open_return_path(s->to_dst_file);
@@ -1825,9 +1837,11 @@ static void *migration_thread(void *opaque)
         int64_t current_time;
         uint64_t pending_size;
 
+        // 如果速度未超过限制且未出错
         if (!qemu_file_rate_limit(s->to_dst_file)) {
             uint64_t pend_post, pend_nonpost;
 
+            // 计算所有设备的 pend_nonpost / pend_post 总和
             qemu_savevm_state_pending(s->to_dst_file, max_size, &pend_nonpost,
                                       &pend_post);
             pending_size = pend_nonpost + pend_post;
@@ -1857,7 +1871,7 @@ static void *migration_thread(void *opaque)
                 break;
             }
         }
-
+        // 可能是qemu_file_rate_limit返回1导致，需要检查下有没出错
         if (qemu_file_get_error(s->to_dst_file)) {
             migrate_set_state(&s->state, current_active_state,
                               MIGRATION_STATUS_FAILED);
@@ -1947,7 +1961,9 @@ void migrate_fd_connect(MigrationState *s)
     s->expected_downtime = s->parameters.downtime_limit;
     s->cleanup_bh = qemu_bh_new(migrate_fd_cleanup, s);
 
+    // 设置要发送的QEMUFile
     qemu_file_set_blocking(s->to_dst_file, true);
+    // 限制速度
     qemu_file_set_rate_limit(s->to_dst_file,
                              s->parameters.max_bandwidth / XFER_LIMIT_RATIO);
 
@@ -1958,6 +1974,7 @@ void migrate_fd_connect(MigrationState *s)
      * Open the return path; currently for postcopy but other things might
      * also want it.
      */
+    // return path
     if (migrate_postcopy_ram()) {
         if (open_return_path_on_source(s)) {
             error_report("Unable to open return-path for postcopy");
@@ -1969,12 +1986,13 @@ void migrate_fd_connect(MigrationState *s)
     }
 
     migrate_compress_threads_create();
+    // 创建迁移线程，执行migration_thread
     qemu_thread_create(&s->thread, "migration", migration_thread, s,
                        QEMU_THREAD_JOINABLE);
     s->migration_thread_running = true;
 }
 
-PostcopyState  postcopy_state_get(void)
+PostcopyState postcopy_state_get(void)
 {
     return atomic_mb_read(&incoming_postcopy_state);
 }
