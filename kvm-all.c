@@ -698,6 +698,7 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
     int err;
     MemoryRegion *mr = section->mr;
     bool writeable = !mr->readonly && !mr->rom_device;
+    // 起始GPA
     hwaddr start_addr = section->offset_within_address_space;
     ram_addr_t size = int128_get64(section->size);
     void *ram = NULL;
@@ -706,11 +707,13 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
     /* kvm works in page size chunks, but the function may be called
        with sub-page size and unaligned start address. Pad the start
        address to next and truncate size to previous page boundary. */
+    // 需要页对齐
     delta = qemu_real_host_page_size - (start_addr & ~qemu_real_host_page_mask);
     delta &= ~qemu_real_host_page_mask;
     if (delta > size) {
         return;
     }
+    // region section在AddressSpace内的偏移量(offset_within_address_space) + 页对齐修正(delta) 得到section真正的GPA
     start_addr += delta;
     size -= delta;
     size &= qemu_real_host_page_mask;
@@ -718,6 +721,7 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
         return;
     }
 
+    // 对于rom，需要校验权限
     if (!memory_region_is_ram(mr)) {
         if (writeable || !kvm_readonly_mem_allowed) {
             return;
@@ -727,15 +731,29 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
             add = false;
         }
     }
-
+    // region起始HVA + region section在region中的偏移量 + 页对齐修正 得到section真正的起始HVA
+    // 起始HVA通过memory_region_get_ram_ptr算出，流程如下：
+    //     如果当前region是另一个region的alias，则会向上追溯，一直追溯到非alias region(实体region)为止
+    //     将追溯过程中的 alias_offset 加起来，可以得到当前region在实体region中的偏移量。
+    //     由于实体region具有对应的RAMBlock，所以调用 qemu_map_ram_ptr ，将实体region对应的ram_block的 host 和总offset加起来，得到当前region起始HVA
     ram = memory_region_get_ram_ptr(mr) + section->offset_within_region + delta;
+
+    // 遍历所有 KVMSlot ，查找和新section有地址空间重叠的KVMSlot区域
+    // 假设原slot可以切分成三个部分：prefix slot + overlap slot + suffix slot，重叠区域为overlap
+    // 对于完全重叠的情况，既有prefix slot又有suffix slot。无需注册新slot。
+    // 对于部分重叠的情况，prefix slot = 0 或 suffix slot = 0。则执行以下流程：
+    //     1. 删除原有slot
+    //     2. 注册prefix slot 或 suffix slot
+    //     3. 注册overlap slot
+
 
     while (1) {
         mem = kvm_lookup_overlapping_slot(kml, start_addr, start_addr + size);
+        // 没重叠
         if (!mem) {
             break;
         }
-
+        // 完全重叠，即新slot包含在原有slot内，则不用注册新slot了，把旧slot的flags更新为新slot的就好
         if (add && start_addr >= mem->start_addr &&
             (start_addr + size <= mem->start_addr + mem->memory_size) &&
             (ram - start_addr == mem->ram - mem->start_addr)) {
@@ -744,7 +762,7 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
             kvm_slot_update_flags(kml, mem, mr);
             return;
         }
-
+        // 暂存旧slot
         old = *mem;
 
         if (mem->flags & KVM_MEM_LOG_DIRTY_PAGES) {
@@ -752,6 +770,7 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
         }
 
         /* unregister the overlapping slot */
+        // 设置旧slot的memory_size为0，调用KVM_SET_USER_MEMORY_REGION，表示在KVM中删除该slot
         mem->memory_size = 0;
         err = kvm_set_user_memory_region(kml, mem);
         if (err) {
@@ -768,6 +787,7 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
          * address as the first existing one. If not or if some overlapping
          * slot comes around later, we will fail (not seen in practice so far)
          * - and actually require a recent KVM version. */
+        // 较新的KVM，broken_set_mem_region为0
         if (s->broken_set_mem_region &&
             old.start_addr == start_addr && old.memory_size < size && add) {
             mem = kvm_alloc_slot(kml);
@@ -788,8 +808,10 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
             size -= old.memory_size;
             continue;
         }
-
+        // 接下来只需考虑部分重叠，要么old在前，要么old在后
         /* register prefix slot */
+        // old在前，则没有suffix
+        // 注册prefix部分 (old.start_addr 到 start_addr)
         if (old.start_addr < start_addr) {
             mem = kvm_alloc_slot(kml);
             mem->memory_size = start_addr - old.start_addr;
@@ -811,6 +833,8 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
         }
 
         /* register suffix slot */
+        // old在后，则没有prefix
+        // 注册suffix部分 (start_addr + size 到 old.start_addr + old.memory_size)
         if (old.start_addr + old.memory_size > start_addr + size) {
             ram_addr_t size_delta;
 
@@ -837,6 +861,8 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
     if (!add) {
         return;
     }
+
+    // 注册新slot(可能是overlap，也可能没有overlap直接添加)
     mem = kvm_alloc_slot(kml);
     mem->memory_size = size;
     mem->start_addr = start_addr;

@@ -628,22 +628,38 @@ static void render_memory_region(FlatView *view,
     FlatRange fr;
     AddrRange tmp;
 
+    // binss debug
+    int debug_alias = 0;
+    int debug_sub = 0;
+
     if (!mr->enabled) {
         return;
     }
-
+    // base都GPA
+    // 通过递归的方式，将各个子region都映射到clip范围内，在整个过程中clip保持不变，变的只是base
+    // base = clip的base + mr->addr(当前region在父region中的偏移量)，作为当前region在clip中对应的起始地址
     int128_addto(&base, int128_make64(mr->addr));
     readonly |= mr->readonly;
 
+    // 根据MemoryRegion范围创建一个地址范围 (base + mr->addr 到 base + mr->addr + mr->size)
     tmp = addrrange_make(base, mr->size);
-
+    // 如果两个范围没重叠，直接返回
+    // 不太可能发生，对于根级region，clip范围足够大(2^64)
+    // 对于alias的实体region，clip是alias的范围，alias是指向实体region的一部分，肯定有重叠
+    // 对于subregion，clip是父region的范围
     if (!addrrange_intersects(tmp, clip)) {
         return;
     }
-
+    // 两个范围重叠，取重叠部分(剪掉多余的地址空间)
     clip = addrrange_intersection(tmp, clip);
 
+    // 如果当前region是alias region，需要对其对应的实体region进行映射
+    // base减去mr->alias_offset得到实体region的起始地址
+    // 由于已经加过当前region在父region中的偏移量了，无需再做。但递归调用后又会执行base += mr->alias->addr，因此这里先减去
+    // clip只有当前region那么大
+    // 因此该递归调用实际做的是：将当前region在实体region的部分映射到clip中
     if (mr->alias) {
+        debug_alias = 1;
         int128_subfrom(&base, int128_make64(mr->alias->addr));
         int128_subfrom(&base, int128_make64(mr->alias_offset));
         render_memory_region(view, mr->alias, base, clip, readonly);
@@ -651,39 +667,66 @@ static void render_memory_region(FlatView *view,
     }
 
     /* Render subregions in priority order. */
+    // 递归调用，对于所有子region进行映射
+    // 使用当前region的base和clip作为子region的base和clip
     QTAILQ_FOREACH(subregion, &mr->subregions, subregions_link) {
+        debug_sub = 1;
         render_memory_region(view, subregion, base, clip, readonly);
     }
 
+    // 凡是初始化过内存的region，terminates都为true
+    // 因此这里检查的是region是否已经分配过内存，如果没，无需展开为 FlatRange
     if (!mr->terminates) {
         return;
     }
+    // 至此为止，如果当前region是alias region，则已经返回；如果是实体region，它的subregion们也都已映射完成
+    // 剩下需要对当前region进行映射
+
+
+    // 计算base相对于region起始位置的偏移量
+    // 对于实体region，参数传入的clip范围比tmp大，因此clip和tmp重叠部分的开始地址(clip.start)等于tmp的起始地址base，因此offset_in_region为0
+    // 对于alias region，参数传入的clip范围比tmp小，因为alias只是实体region的一部分，在实现上体现为base减了alias_offset，而size根据定义会更大
+    //   因此clip和tmp重叠部分的开始地址(clip.start)等于参数传入的clip.start，因此offset_in_region为alias_offset
+    // 由于当前region可能被拆到多个不相邻的FlatRange中(先前有别的region已经占坑)，需要通过设置fr的offset_in_region来维护alias region与其实体region的GPA差
+    // 该差值用于换算HVA
 
     offset_in_region = int128_get64(int128_sub(clip.start, base));
+    // 准备将当前region展开为 FlatRange ，范围为 clip.start 到 clip.size
     base = clip.start;
     remain = clip.size;
-
+    // 需要插入的新 FlatRange
     fr.mr = mr;
     fr.dirty_log_mask = memory_region_get_dirty_log_mask(mr);
     fr.romd_mode = mr->romd_mode;
     fr.readonly = readonly;
 
     /* Render the region itself into any gaps left by the current view. */
+    // 遍历 FlatView 中的 FlatRange
     for (i = 0; i < view->nr && int128_nz(remain); ++i) {
+        // 如果当前FlatRange的结束地址小于base，跳过
         if (int128_ge(base, addrrange_end(view->ranges[i].addr))) {
             continue;
         }
+        // 如果当前FlatRange的起始地址大于base，在它前面插入fr
         if (int128_lt(base, view->ranges[i].addr.start)) {
+            // 计算可以插到当前FlatRange前面的大小
             now = int128_min(remain,
                              int128_sub(view->ranges[i].addr.start, base));
             fr.offset_in_region = offset_in_region;
             fr.addr = addrrange_make(base, now);
+            // 把这部分fr插入到当前的FlatRange前
             flatview_insert(view, i, &fr);
+            // 插入后，为了指向当前FlatRange位于i+1
             ++i;
+            // fr还剩下 (base+now, base+remain)
             int128_addto(&base, now);
             offset_in_region += int128_get64(now);
             int128_subfrom(&remain, now);
         }
+        // 至此当前FlatRange的起始地址小于等于base
+        // 如果当前FlatRange的结束地址大于fr的结束地址(base+remain)，则now即为remain，此时fr的剩余范围完全被当前FlatRange覆盖，无需新增新FlatRange
+        // 如果当前FlatRange的结束地址小于fr的结束地址(base+remain)，则now即为当前FlatRange的结束地址 - base，此段范围被当前FlatRange覆盖，无需新增新FlatRange
+        //   但此时fr还剩下 (当前FlatRange的结束地址, base+remain)，推到下一轮迭代(i+1)进行处理，如果位置足够的话会插入到i+1的FlatRange前
         now = int128_sub(int128_min(int128_add(base, remain),
                                     addrrange_end(view->ranges[i].addr)),
                          base);
@@ -691,10 +734,17 @@ static void render_memory_region(FlatView *view,
         offset_in_region += int128_get64(now);
         int128_subfrom(&remain, now);
     }
+    // 如果一直到最后，fr还剩下部分没插入，在最后的FlatRange后插入之
+    // 注意前面的for循环最后执行了i++，此时i指向的数组位置为空，将该位置设置为fr即可
     if (int128_nz(remain)) {
         fr.offset_in_region = offset_in_region;
         fr.addr = addrrange_make(base, remain);
         flatview_insert(view, i, &fr);
+    }
+
+    // binss debug
+    if(debug_alias == 0 && debug_sub == 0){
+        printf("[debug] render_memory_region mr.name = %s, offset_in_region = 0x%x\n", mr->name, offset_in_region);
     }
 }
 
@@ -707,9 +757,11 @@ static FlatView *generate_memory_topology(MemoryRegion *mr)
     flatview_init(view);
 
     if (mr) {
+        // 创建一个起始地址为0，结束地址为2^64的地址范围，作为展开MemoryRegion的地址空间
         render_memory_region(view, mr, int128_zero(),
                              addrrange_make(int128_zero(), int128_2_64()), false);
     }
+    // 简化
     flatview_simplify(view);
 
     return view;

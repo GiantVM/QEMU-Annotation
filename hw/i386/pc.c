@@ -1388,6 +1388,7 @@ void pc_memory_init(PCMachineState *pcms,
     ram_below_4g = g_malloc(sizeof(*ram_below_4g));
     memory_region_init_alias(ram_below_4g, NULL, "ram-below-4g", ram,
                              0, pcms->below_4g_mem_size);
+    // 1. ram_below_4g 作为 system_memory 的subregion
     memory_region_add_subregion(system_memory, 0, ram_below_4g);
     e820_add_entry(0, pcms->below_4g_mem_size, E820_RAM);
     if (pcms->above_4g_mem_size > 0) {
@@ -1395,6 +1396,7 @@ void pc_memory_init(PCMachineState *pcms,
         memory_region_init_alias(ram_above_4g, NULL, "ram-above-4g", ram,
                                  pcms->below_4g_mem_size,
                                  pcms->above_4g_mem_size);
+        // 2. ram_above_4g 作为 system_memory 的subregion
         memory_region_add_subregion(system_memory, 0x100000000ULL,
                                     ram_above_4g);
         e820_add_entry(0x100000000ULL, pcms->above_4g_mem_size, E820_RAM);
@@ -1446,6 +1448,7 @@ void pc_memory_init(PCMachineState *pcms,
 
         memory_region_init(&pcms->hotplug_memory.mr, OBJECT(pcms),
                            "hotplug-memory", hotplug_mem_size);
+        // 3. hotplug_memory.mr 作为 system_memory 的subregion
         memory_region_add_subregion(system_memory, pcms->hotplug_memory.base,
                                     &pcms->hotplug_memory.mr);
     }

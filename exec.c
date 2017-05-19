@@ -1724,7 +1724,7 @@ RAMBlock *qemu_ram_alloc_internal(ram_addr_t size, ram_addr_t max_size,
     new_block->max_length = max_size;
     assert(max_size >= size);
     new_block->fd = -1;
-    new_block->page_size = getpagesize();
+    new_block->page_size = getpagesize();           // page大小和host保持一致
     new_block->host = host;
     if (host) {
         new_block->flags |= RAM_PREALLOC;
